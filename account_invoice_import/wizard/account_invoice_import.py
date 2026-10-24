@@ -6,6 +6,8 @@
 import html
 import logging
 import mimetypes
+import os
+import re
 from collections import defaultdict
 from email.utils import parseaddr
 from io import BytesIO
@@ -18,7 +20,7 @@ from stdnum.iban import is_valid as iban_is_valid
 
 from odoo import Command, api, fields, models
 from odoo.exceptions import UserError
-from odoo.tools import config, float_is_zero, float_round
+from odoo.tools import config, float_compare, float_is_zero, float_round
 from odoo.tools.misc import format_amount, formatLang
 
 from odoo.addons.base.models.res_bank import sanitize_account_number
@@ -1300,6 +1302,152 @@ class AccountInvoiceImport(models.TransientModel):
                 currency = import_config["company"].currency_id
             import_config["invoice_currency"] = currency
 
+    def _parse_import_files(self, speedy):
+        """Parse each file of the wizard on its own, so that an error
+        on one file doesn't prevent the import of the others."""
+        import_files = []
+        for attach in self.invoice_attachment_ids:
+            import_config = {
+                "company": self.company_id,
+                "origin": self.env._("Import of file %s", attach.name),
+                "debug_disable_company_check": self.debug_disable_company_check,
+            }
+            self._update_import_config(import_config, speedy)
+            import_file = {
+                "attach": attach,
+                "import_config": import_config,
+                "parsed_inv": False,
+                "error": False,
+                "paired_with": False,
+                "paired_files": [],
+            }
+            try:
+                with self.env.cr.savepoint():
+                    import_file["parsed_inv"] = self.parse_invoice(
+                        attach.raw, attach.name, import_config
+                    )
+            except Exception as err:
+                import_file["error"] = err
+            import_files.append(import_file)
+        return import_files
+
+    @api.model
+    def _is_xml_filename(self, filename):
+        filetype = mimetypes.guess_type(filename or "")
+        return bool(filetype and filetype[0] in ("application/xml", "text/xml"))
+
+    @api.model
+    def _same_import_seller(self, partner_dict1, partner_dict2):
+        for key in ("vat_identifier", "legal_identifier", "einvoicing_addr"):
+            value1 = re.sub(r"[^0-9A-Za-z]", "", partner_dict1.get(key) or "").upper()
+            value2 = re.sub(r"[^0-9A-Za-z]", "", partner_dict2.get(key) or "").upper()
+            if value1 and value2:
+                return value1 == value2
+        name1 = (partner_dict1.get("name") or "").strip().casefold()
+        return (
+            bool(name1)
+            and name1 == (partner_dict2.get("name") or "").strip().casefold()
+        )
+
+    @api.model
+    def _get_import_file_pairing_score(self, xml_file, pdf_file):
+        """Return how surely pdf_file is the PDF version of the XML invoice
+        of xml_file: 3 = same file name, 2 = same seller, number and total
+        amount once the PDF is read, 1 = invoice number written in the file
+        name of the PDF, 0 = not paired."""
+        xml_name = xml_file["attach"].name or ""
+        pdf_name = pdf_file["attach"].name or ""
+        if (
+            os.path.splitext(xml_name)[0].casefold()
+            == os.path.splitext(pdf_name)[0].casefold()
+        ):
+            return 3
+        xml_inv = xml_file["parsed_inv"]
+        raw_number = (xml_inv.get("BT-1") or "").strip().upper()
+        number = re.sub(r"[^0-9A-Za-z]", "", raw_number)
+        if not number:
+            return 0
+        pdf_inv = pdf_file["parsed_inv"]
+        if pdf_inv:
+            pdf_number = re.sub(r"[^0-9A-Za-z]", "", pdf_inv.get("BT-1") or "")
+            try:
+                same_total = not float_compare(
+                    float(xml_inv.get("BT-112") or 0),
+                    float(pdf_inv.get("BT-112") or 0),
+                    precision_digits=2,
+                )
+            except (TypeError, ValueError):
+                same_total = False
+            if (
+                pdf_number.upper() == number
+                and xml_inv.get("BT-5") == pdf_inv.get("BT-5")
+                and same_total
+                and self._same_import_seller(
+                    self._get_partner_dict(xml_inv, xml_file["import_config"]),
+                    self._get_partner_dict(pdf_inv, pdf_file["import_config"]),
+                )
+            ):
+                return 2
+        # Invoice number written as a whole word in the PDF file name,
+        # e.g. INV0124AA.pdf or Invoice_FA-2017-0010.pdf
+        pdf_stem = os.path.splitext(pdf_name)[0].upper()
+        if re.search(rf"(?<![0-9A-Z]){re.escape(raw_number)}(?![0-9A-Z])", pdf_stem):
+            return 1
+        return 0
+
+    @api.model
+    def _is_pdf_import_file(self, import_file):
+        attach = import_file["attach"]
+        return (
+            mimetypes.guess_type(attach.name or "")[0] == "application/pdf"
+            or (attach.raw or b"")[:5] == b"%PDF-"
+        )
+
+    @api.model
+    def _pair_import_files(self, import_files):
+        """When a PDF and its XML invoice are uploaded together, the XML is
+        imported and the PDF is attached to the invoice as its original.
+        Each PDF goes to the XML with the best score; it stays alone when
+        two XML files share the best score or when it can't be read."""
+        xml_files = [
+            import_file
+            for import_file in import_files
+            if import_file["parsed_inv"]
+            and self._is_xml_filename(import_file["attach"].name)
+        ]
+        for pdf_file in import_files:
+            if (
+                pdf_file in xml_files
+                or pdf_file["error"]
+                or self._is_xml_filename(pdf_file["attach"].name)
+                or not self._is_pdf_import_file(pdf_file)
+            ):
+                continue
+            scores = [
+                (self._get_import_file_pairing_score(xml_file, pdf_file), xml_file)
+                for xml_file in xml_files
+            ]
+            best_score = max([score for score, _xml_file in scores], default=0)
+            best_xml_files = [
+                xml_file for score, xml_file in scores if score and score == best_score
+            ]
+            if len(best_xml_files) == 1:
+                pdf_file["paired_with"] = best_xml_files[0]
+                best_xml_files[0]["paired_files"].append(pdf_file)
+
+    @api.model
+    def _add_paired_file(self, parsed_inv, attach, import_config):
+        attachments = parsed_inv.setdefault("BG-24", [])
+        # Skip only the same content (e.g. the PDF already embedded in the XML):
+        # a different file with the same name is kept
+        if any(attach_dict.get("BT-125") == attach.raw for attach_dict in attachments):
+            return
+        attachments.append({"BT-125": attach.raw, "BT-125-2": attach.name})
+        self._info_log(
+            import_config,
+            f"File {attach.name} attached to the invoice as its PDF version",
+        )
+
     def import_invoices_button(self):
         """Method called by the button of the wizard"""
         self.ensure_one()
@@ -1309,15 +1457,45 @@ class AccountInvoiceImport(models.TransientModel):
         invoice_ids = []
         speedy = self._prepare_speedy()
         action_warnings = []
-        for attach in self.invoice_attachment_ids:
-            import_config = {
-                "company": self.company_id,
-                "origin": self.env._("Import of file %s", attach.name),
-                "debug_disable_company_check": self.debug_disable_company_check,
-            }
-            self._update_import_config(import_config, speedy)
-            parsed_inv = self.parse_invoice(attach.raw, attach.name, import_config)
-            invoice = self.create_invoice(parsed_inv, import_config)
+        import_files = self._parse_import_files(speedy)
+        self._pair_import_files(import_files)
+        for import_file in import_files:
+            if import_file["paired_with"]:
+                continue
+            import_config = import_file["import_config"]
+            try:
+                if import_file["error"]:
+                    raise import_file["error"]
+                with self.env.cr.savepoint():
+                    parsed_inv = import_file["parsed_inv"]
+                    for paired_file in import_file["paired_files"]:
+                        self._add_paired_file(
+                            parsed_inv, paired_file["attach"], import_config
+                        )
+                    invoice = self.create_invoice(parsed_inv, import_config)
+            except Exception as err:
+                # In a batch, the faulty file is reported and the others are
+                # imported. A single file raises the error, as before.
+                if isinstance(err, UserError):
+                    if len(import_files) == 1:
+                        raise
+                    error = str(err)
+                else:
+                    logger.exception(
+                        "Failed to import file %s", import_file["attach"].name
+                    )
+                    error = self.env._(
+                        "unreadable or damaged file (%s)", str(err) or repr(err)
+                    )
+                file_msg = self.env._(
+                    "%(filename)s: %(error)s",
+                    filename=import_file["attach"].name,
+                    error=error,
+                )
+                if len(import_files) == 1:
+                    raise UserError(file_msg) from err
+                action_warnings.append(file_msg)
+                continue
             if invoice:
                 invoice_ids.append(invoice.id)
             action_warnings += import_config.get("action_warnings")
